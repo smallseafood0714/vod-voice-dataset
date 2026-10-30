@@ -5,6 +5,9 @@ data/**
 ref/**
 !ref/.gitkeep
 
+# 壓力測試等執行紀錄
+logs/
+
 # Python
 __pycache__/
 *.py[cod]

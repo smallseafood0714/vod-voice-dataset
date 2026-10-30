@@ -14,7 +14,7 @@
 | 2（選用） | `01_audio` → `02_vocals/` | 人聲分離，去掉殘留的音樂與遊戲音效，輸出單聲道。乾淨的畫圖實況可跳過 |
 | 3 | `02_vocals` 或 `01_audio` → `03_segments/` | 用 Silero VAD 切成 2～15 秒小段，附 `segments.csv` |
 | 4 | `03_segments` → `04_filtered/` | 說話人比對（只留自己的聲音），並篩掉太小聲、爆音的段落，附 `scores.csv` |
-| 5 | `04_filtered` → `05_dataset/` | 轉文字，輸出最終的音檔與文字對照清單 |
+| 5 | `04_filtered` → `05_dataset/` | 用 Paraformer 轉文字、SenseVoice 對照，輸出逐字稿 CSV 和 GPT-SoVITS 的 `.list` |
 
 `ref/` 放 1～2 分鐘自己的乾淨錄音，第 4 步用來當聲紋基準。
 
@@ -47,12 +47,28 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 
 模型權重第一次執行時會自動下載到 `models/`。
 
+### GPU 壓力測試
+
+這張 4060 跑人聲分離會掉卡藍屏，訓練前先確認它撐不撐得住長時間滿載：
+
+```bash
+.venv\Scripts\python.exe scripts\gpu_stress.py --minutes 30
+```
+
+- 跑一個類似訓練的迴圈（transformer、fp16、反向傳播），自動挑 batch 讓顯存用到約 70%（`--vram-fraction`）。
+- 每 10 秒把溫度、功耗、時脈、降頻原因寫進 `logs/gpu_stress_<時間>.csv`，每行都立刻寫進硬碟。
+  藍屏重開機後看最後一行，就知道掛掉前的狀態。
+- 同時檢查算出來的結果有沒有錯（`errors` 欄）：沒當機但算錯，一樣代表不穩定，結束時會印 `FAILED`。
+- 滿載會掛的話，用 `--load 0.5` 讓 GPU 只忙一半的時間，找出撐得住的負載。
+- 不要和其他吃 GPU 的程式（例如第 2 步）同時跑。
+
 ## 執行
 
 ```bash
 .venv\Scripts\python.exe scripts\01_extract_audio.py
 .venv\Scripts\python.exe scripts\03_segment.py
 .venv\Scripts\python.exe scripts\04_filter.py
+.venv\Scripts\python.exe scripts\05_transcribe.py
 ```
 
 需要人聲分離的影片（遊戲、音樂），在第 1 步和第 3 步之間加跑，後面接影片 ID。
@@ -66,6 +82,7 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 - 第 2 步預設用 `vocals_mel_band_roformer.ckpt`（Kim 的 MelBand RoFormer），可用 `--model` 換。
 - **目前一定要加 `--cpu`**：這台筆電的 RTX 4060 一跑分離就會掉卡，幾分鐘後藍屏（0x113）。
   `--cpu` 會把顯示卡藏起來完全不碰。CPU 速度約等於即時（1 小時有聲音訊要 1 小時）。
+  原因是 CPU 和顯示卡之間的 PCIe 連線出錯，不是過熱；診斷過程和還沒解決的部分記在 [docs/stuck-items.md](docs/stuck-items.md)。
 - 低於 `--threshold-db`（預設 -50 dB）的部分不送進模型，直接輸出靜音，輸出和原檔時間軸對齊。
   實況裡沒講話時幾乎是數位靜音（-75 dB 以下），這樣只需要跑 15～35% 的時間。
   背景一直有遊戲聲或音樂的影片幾乎整段都超過門檻，就省不到時間。
@@ -90,5 +107,24 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
   每段的分數和丟掉的原因寫在 `data/04_filtered/scores.csv`。
   聲紋會快取在 `data/04_filtered/_cache/`，新影片進來重跑時只會算新的；
   基準是用全部片段重算的，所以舊影片的去留也可能跟著微調。
+- 第 5 步用 FunASR 的 Paraformer-zh（加標點模型）轉文字，再用 SenseVoiceSmall 轉一次當對照，都只用 CPU。
+  第一次跑會下載約 3 GB 模型到 `models/modelscope/`。速度約即時的 20～30 倍，3 小時的片段兩個模型合計約 15 分鐘。
+  - 選 Paraformer 當主要結果：同樣 30 段比較，它認字比較準（例如「卡拉雞腿堡」SenseVoice 聽成「卡拉基腿跑」），
+    數字也會寫成中文字，比較適合 TTS。文字用 OpenCC `s2twp` 轉成台灣繁體。
+  - 每部影片一份 `data/05_dataset/transcripts/<影片ID>.csv`（UTF-8 with BOM）。
+    `alt_text` 是 SenseVoice 的結果，`agree` 是兩邊的相似度（0～1），`confidence` 是 Paraformer 的信心，
+    `emotion`、`event` 是 SenseVoice 的情緒和聲音事件標記。
+  - 空白、只有語助詞、日文（大多是唱歌）、每秒字數太低或太高（`--min-cps` 1.5、`--max-cps` 9）、
+    兩個模型相似度低於 `--min-agree`（0.5）的片段，`keep` 標 0，原因寫在 `flag`。
+  - 全英文的片段 `lang` 標 `en`。GPT-SoVITS 處理 `zh` 文字時會把英文字母刪掉，
+    所以中文夾英文的片段（`english` 欄 = 1）訓練時會少掉那幾個英文字。
+  - `data/05_dataset/<講者>.list`（預設 `me.list`）是 GPT-SoVITS 的訓練清單，格式 `wav 路徑|講者|語言|文字`，
+    只收 `keep` = 1 的片段。**裡面是絕對路徑**，整個資料夾搬家後重跑一次腳本就會用新路徑重建。
+  - 片段也會複製到 `data/05_dataset/wavs/`，讓這個資料夾單獨備份也完整。
+  - **校對**：用 Excel 開逐字稿 CSV，照 `agree` 由低到高排，改 `text` 或 `keep`，存成「CSV UTF-8」後重跑腳本。
+    已經有逐字稿的影片不會重新轉文字，只會重建 `.list`。
+  - 轉錄準確度普通：實況用語、暱稱、人名常被聽錯（例如「十炎老師」被聽成「實驗老師」）。
+
+每一步實際留下多少資料，記在 [docs/data-yield.md](docs/data-yield.md)。
 
 音訊資料一律不進 git（見 `.gitignore`）。
