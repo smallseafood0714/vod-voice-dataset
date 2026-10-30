@@ -1,0 +1,8 @@
+# PyTorch (CUDA build) is installed separately first, see README.
+audio-separator[cpu]==0.48.0
+# librosa 1.0 dropped audioread, which audio-separator still imports
+librosa<1
+numpy
+silero-vad
+soundfile
+speechbrain
