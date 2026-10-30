@@ -1,0 +1,18 @@
+# 音訊與影片資料不進 git，只保留資料夾結構
+data/**
+!data/**/
+!data/**/.gitkeep
+ref/**
+!ref/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# 模型權重快取
+models/
+*.ckpt
+*.pth
+*.onnx
